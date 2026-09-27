@@ -1,0 +1,811 @@
+diff --git a/engine/src/flutter/shell/platform/linux/fl_display_monitor.cc b/engine/src/flutter/shell/platform/linux/fl_display_monitor.cc
+index bea40b2cbd111..76ad84651c053 100644
+--- a/engine/src/flutter/shell/platform/linux/fl_display_monitor.cc
++++ b/engine/src/flutter/shell/platform/linux/fl_display_monitor.cc
+@@ -23,6 +23,15 @@ struct _FlDisplayMonitor {
+ 
+ G_DEFINE_TYPE(FlDisplayMonitor, fl_display_monitor, G_TYPE_OBJECT)
+ 
++// Get the refresh rate of a GDK monitor in Hz, or 0 if unknown.
++static gdouble get_monitor_refresh_rate(GdkMonitor* monitor) {
++  if (monitor == nullptr) {
++    return 0.0;
++  }
++  // GDK reports the refresh rate in millihertz.
++  return gdk_monitor_get_refresh_rate(monitor) / 1000.0;
++}
++
+ // Send the current monitor state to the engine.
+ static void notify_display_update(FlDisplayMonitor* self) {
+   g_autoptr(FlEngine) engine = FL_ENGINE(g_weak_ref_get(&self->engine));
+@@ -52,7 +61,7 @@ static void notify_display_update(FlDisplayMonitor* self) {
+     display->struct_size = sizeof(FlutterEngineDisplay);
+     display->display_id = display_id;
+     display->single_display = false;
+-    display->refresh_rate = gdk_monitor_get_refresh_rate(monitor) / 1000.0;
++    display->refresh_rate = get_monitor_refresh_rate(monitor);
+     display->width = geometry.width;
+     display->height = geometry.height;
+     display->device_pixel_ratio = gdk_monitor_get_scale_factor(monitor);
+@@ -118,3 +127,33 @@ FlutterEngineDisplayId fl_display_monitor_get_display_id(FlDisplayMonitor* self,
+   return GPOINTER_TO_INT(
+       g_hash_table_lookup(self->display_ids_by_monitor, monitor));
+ }
++
++gdouble fl_display_monitor_get_refresh_rate(FlDisplayMonitor* self,
++                                            FlutterEngineDisplayId display_id) {
++  g_return_val_if_fail(FL_IS_DISPLAY_MONITOR(self), 0.0);
++
++  GHashTableIter iter;
++  g_hash_table_iter_init(&iter, self->display_ids_by_monitor);
++  gpointer key, value;
++  while (g_hash_table_iter_next(&iter, &key, &value)) {
++    if (static_cast<FlutterEngineDisplayId>(GPOINTER_TO_INT(value)) ==
++        display_id) {
++      return get_monitor_refresh_rate(GDK_MONITOR(key));
++    }
++  }
++
++  return 0.0;
++}
++
++gdouble fl_display_monitor_get_max_refresh_rate(FlDisplayMonitor* self) {
++  g_return_val_if_fail(FL_IS_DISPLAY_MONITOR(self), 0.0);
++
++  gdouble max_refresh_rate = 0.0;
++  int n_monitors = gdk_display_get_n_monitors(self->display);
++  for (int i = 0; i < n_monitors; i++) {
++    GdkMonitor* monitor = gdk_display_get_monitor(self->display, i);
++    max_refresh_rate = MAX(max_refresh_rate, get_monitor_refresh_rate(monitor));
++  }
++
++  return max_refresh_rate;
++}
+diff --git a/engine/src/flutter/shell/platform/linux/fl_display_monitor.h b/engine/src/flutter/shell/platform/linux/fl_display_monitor.h
+index 5660a9671c8ef..31d9d9fe39402 100644
+--- a/engine/src/flutter/shell/platform/linux/fl_display_monitor.h
++++ b/engine/src/flutter/shell/platform/linux/fl_display_monitor.h
+@@ -51,6 +51,28 @@ FlutterEngineDisplayId fl_display_monitor_get_display_id(
+     FlDisplayMonitor* monitor,
+     GdkMonitor* gdk_monitor);
+ 
++/**
++ * fl_display_monitor_get_refresh_rate:
++ * @monitor: an #FlDisplayMonitor.
++ * @display_id: ID Flutter is using for a display.
++ *
++ * Get the refresh rate of the display with the given ID.
++ *
++ * Returns: refresh rate in Hz or 0 if unknown.
++ */
++gdouble fl_display_monitor_get_refresh_rate(FlDisplayMonitor* monitor,
++                                            FlutterEngineDisplayId display_id);
++
++/**
++ * fl_display_monitor_get_max_refresh_rate:
++ * @monitor: an #FlDisplayMonitor.
++ *
++ * Get the highest refresh rate of all the displays currently connected.
++ *
++ * Returns: refresh rate in Hz or 0 if unknown.
++ */
++gdouble fl_display_monitor_get_max_refresh_rate(FlDisplayMonitor* monitor);
++
+ G_END_DECLS
+ 
+ #endif  // FLUTTER_SHELL_PLATFORM_LINUX_FL_DISPLAY_MONITOR_H_
+diff --git a/engine/src/flutter/shell/platform/linux/fl_display_monitor_test.cc b/engine/src/flutter/shell/platform/linux/fl_display_monitor_test.cc
+index 29ae22b009cfa..1f53c6b660039 100644
+--- a/engine/src/flutter/shell/platform/linux/fl_display_monitor_test.cc
++++ b/engine/src/flutter/shell/platform/linux/fl_display_monitor_test.cc
+@@ -7,6 +7,7 @@
+ #include "flutter/shell/platform/linux/fl_engine_private.h"
+ 
+ #include "flutter/shell/platform/linux/testing/linux_test.h"
++#include "flutter/shell/platform/linux/testing/mock_gtk.h"
+ #include "gtest/gtest.h"
+ 
+ class FlDisplayMonitorTest : public flutter::testing::LinuxTest {};
+@@ -32,3 +33,30 @@ TEST_F(FlDisplayMonitorTest, Test) {
+   fl_display_monitor_start(monitor);
+   EXPECT_TRUE(called);
+ }
++
++TEST_F(FlDisplayMonitorTest, RefreshRate) {
++  ::testing::NiceMock<flutter::testing::MockGtk> mock_gtk;
++  EXPECT_CALL(mock_gtk, gdk_monitor_get_refresh_rate(::testing::_))
++      .WillRepeatedly(::testing::Return(144000));
++
++  StartEngine();
++
++  g_autoptr(FlDisplayMonitor) monitor =
++      fl_display_monitor_new(engine, gdk_display_get_default());
++  fl_display_monitor_start(monitor);
++
++  EXPECT_DOUBLE_EQ(fl_display_monitor_get_refresh_rate(monitor, 1), 144.0);
++  EXPECT_DOUBLE_EQ(fl_display_monitor_get_max_refresh_rate(monitor), 144.0);
++}
++
++TEST_F(FlDisplayMonitorTest, RefreshRateUnknownDisplay) {
++  StartEngine();
++
++  g_autoptr(FlDisplayMonitor) monitor =
++      fl_display_monitor_new(engine, gdk_display_get_default());
++  fl_display_monitor_start(monitor);
++
++  EXPECT_DOUBLE_EQ(fl_display_monitor_get_refresh_rate(monitor, 0), 0.0);
++  EXPECT_DOUBLE_EQ(fl_display_monitor_get_refresh_rate(monitor, 99), 0.0);
++  EXPECT_DOUBLE_EQ(fl_display_monitor_get_max_refresh_rate(monitor), 60.0);
++}
+diff --git a/engine/src/flutter/shell/platform/linux/fl_engine.cc b/engine/src/flutter/shell/platform/linux/fl_engine.cc
+index e7e175bd18740..ef5527fc8554d 100644
+--- a/engine/src/flutter/shell/platform/linux/fl_engine.cc
++++ b/engine/src/flutter/shell/platform/linux/fl_engine.cc
+@@ -35,6 +35,11 @@ static constexpr size_t kPlatformTaskRunnerIdentifier = 1;
+ static constexpr int32_t kMousePointerDeviceId = 0;
+ static constexpr int32_t kPointerPanZoomDeviceId = 1;
+ 
++// Refresh rate assumed when the displays in use are unknown.
++static constexpr double kDefaultRefreshRate = 60.0;
++
++static constexpr uint64_t kNanosecondsPerSecond = 1000000000;
++
+ struct _FlEngine {
+   GObject parent_instance;
+ 
+@@ -103,6 +108,20 @@ struct _FlEngine {
+   // engine threads and GTK.
+   GMutex renderables_mutex;
+ 
++  // Displays each view was last reported on, used to determine the refresh
++  // rate to drive the engine at. Only accessed from the GTK thread.
++  GHashTable* display_ids_by_view_id;
++
++  // Mutex to protect access to frame_interval_nanos which is written by GTK
++  // and read by the vsync callback (which may be on the UI thread).
++  GMutex vsync_mutex;
++
++  // Time between frames on the display(s) views are on, in nanoseconds.
++  uint64_t frame_interval_nanos;
++
++  // Time the engine started, used as the phase for vsync ticks.
++  uint64_t vsync_phase_nanos;
++
+   // Function to call when a platform message is received.
+   FlEnginePlatformMessageHandler platform_message_handler;
+   gpointer platform_message_handler_data;
+@@ -171,6 +190,72 @@ static void parse_locale(const gchar* locale,
+   }
+ }
+ 
++// Round the given time up to the next tick of a clock with the given phase and
++// interval.
++static uint64_t snap_to_next_tick(uint64_t value,
++                                  uint64_t phase,
++                                  uint64_t interval) {
++  if (value <= phase) {
++    return phase;
++  }
++  uint64_t remainder = (value - phase) % interval;
++  if (remainder == 0) {
++    return value;
++  }
++  return value + (interval - remainder);
++}
++
++// Update the interval the engine produces frames at from the displays views are
++// currently on. If the displays are unknown the fastest connected display is
++// used so any view is rendered smoothly.
++static void update_frame_interval(FlEngine* self) {
++  double refresh_rate = 0.0;
++  if (self->display_monitor != nullptr) {
++    GHashTableIter iter;
++    g_hash_table_iter_init(&iter, self->display_ids_by_view_id);
++    gpointer value;
++    while (g_hash_table_iter_next(&iter, nullptr, &value)) {
++      FlutterEngineDisplayId display_id = GPOINTER_TO_INT(value);
++      refresh_rate = MAX(refresh_rate, fl_display_monitor_get_refresh_rate(
++                                           self->display_monitor, display_id));
++    }
++    if (refresh_rate <= 0.0) {
++      refresh_rate =
++          fl_display_monitor_get_max_refresh_rate(self->display_monitor);
++    }
++  }
++  if (refresh_rate <= 0.0) {
++    refresh_rate = kDefaultRefreshRate;
++  }
++
++  g_autoptr(GMutexLocker) locker = g_mutex_locker_new(&self->vsync_mutex);
++  self->frame_interval_nanos = kNanosecondsPerSecond / refresh_rate;
++}
++
++// Called by the engine when it wants to be told when the next frame should
++// start. This may be called on any thread. GTK does not expose a vsync signal
++// for windows that are not being drawn, so the next tick of a clock at the
++// display refresh rate is used instead.
++static void fl_engine_vsync_cb(void* user_data, intptr_t baton) {
++  FlEngine* self = FL_ENGINE(user_data);
++
++  uint64_t frame_interval;
++  {
++    g_autoptr(GMutexLocker) locker = g_mutex_locker_new(&self->vsync_mutex);
++    frame_interval = self->frame_interval_nanos;
++  }
++
++  uint64_t current_time = self->embedder_api.GetCurrentTime();
++  uint64_t frame_start_time =
++      snap_to_next_tick(current_time, self->vsync_phase_nanos, frame_interval);
++  uint64_t frame_target_time = frame_start_time + frame_interval;
++
++  if (self->embedder_api.OnVsync(self->engine, baton, frame_start_time,
++                                 frame_target_time) != kSuccess) {
++    g_warning("Failed to notify vsync to Flutter engine");
++  }
++}
++
+ /// Stores a weak reference to the renderable with the given ID.
+ static void set_renderable(FlEngine* self,
+                            int64_t view_id,
+@@ -196,8 +281,13 @@ static FlRenderable* get_renderable(FlEngine* self, int64_t view_id) {
+ 
+ /// Remove a renderable that no longer exists.
+ static void remove_renderable(FlEngine* self, int64_t view_id) {
+-  g_autoptr(GMutexLocker) locker = g_mutex_locker_new(&self->renderables_mutex);
+-  g_hash_table_remove(self->renderables_by_view_id, GINT_TO_POINTER(view_id));
++  {
++    g_autoptr(GMutexLocker) locker =
++        g_mutex_locker_new(&self->renderables_mutex);
++    g_hash_table_remove(self->renderables_by_view_id, GINT_TO_POINTER(view_id));
++  }
++  g_hash_table_remove(self->display_ids_by_view_id, GINT_TO_POINTER(view_id));
++  update_frame_interval(self);
+ }
+ 
+ static void view_added_cb(const FlutterAddViewResult* result) {
+@@ -628,6 +718,8 @@ static void fl_engine_dispose(GObject* object) {
+     g_clear_pointer(&self->renderables_by_view_id, g_hash_table_unref);
+   }
+   g_mutex_clear(&self->renderables_mutex);
++  g_clear_pointer(&self->display_ids_by_view_id, g_hash_table_unref);
++  g_mutex_clear(&self->vsync_mutex);
+ 
+   if (self->platform_message_handler_destroy_notify) {
+     self->platform_message_handler_destroy_notify(
+@@ -683,6 +775,11 @@ static void fl_engine_init(FlEngine* self) {
+         free(ref);
+       });
+ 
++  self->display_ids_by_view_id =
++      g_hash_table_new(g_direct_hash, g_direct_equal);
++  g_mutex_init(&self->vsync_mutex);
++  self->frame_interval_nanos = kNanosecondsPerSecond / kDefaultRefreshRate;
++
+   self->texture_registrar = fl_texture_registrar_new(self);
+ }
+ 
+@@ -872,6 +969,7 @@ gboolean fl_engine_start(FlEngine* self, GError** error) {
+       reinterpret_cast<const char* const*>(command_line_args->pdata);
+   args.platform_message_callback = fl_engine_platform_message_cb;
+   args.update_semantics_callback2 = fl_engine_update_semantics_cb;
++  args.vsync_callback = fl_engine_vsync_cb;
+   args.custom_task_runners = &custom_task_runners;
+   args.shutdown_dart_vm_when_done = true;
+   args.on_pre_engine_restart_callback = fl_engine_on_pre_engine_restart_cb;
+@@ -904,6 +1002,8 @@ gboolean fl_engine_start(FlEngine* self, GError** error) {
+     args.aot_data = self->aot_data;
+   }
+ 
++  self->vsync_phase_nanos = self->embedder_api.GetCurrentTime();
++
+   FlutterEngineResult result = self->embedder_api.Initialize(
+       FLUTTER_ENGINE_VERSION, &config, &args, self, &self->engine);
+   if (result != kSuccess) {
+@@ -954,6 +1054,8 @@ void fl_engine_notify_display_update(FlEngine* self,
+   if (result != kSuccess) {
+     g_warning("Failed to notify display update to Flutter engine: %d", result);
+   }
++
++  update_frame_interval(self);
+ }
+ 
+ void fl_engine_set_implicit_view(FlEngine* self, FlRenderable* renderable) {
+@@ -1192,6 +1294,10 @@ void fl_engine_send_window_metrics_event(FlEngine* self,
+                                          double pixel_ratio) {
+   g_return_if_fail(FL_IS_ENGINE(self));
+ 
++  g_hash_table_insert(self->display_ids_by_view_id, GINT_TO_POINTER(view_id),
++                      GINT_TO_POINTER(display_id));
++  update_frame_interval(self);
++
+   if (self->engine == nullptr) {
+     return;
+   }
+diff --git a/engine/src/flutter/shell/platform/linux/fl_engine_test.cc b/engine/src/flutter/shell/platform/linux/fl_engine_test.cc
+index 990cd1f253e0c..6390588c14bd0 100644
+--- a/engine/src/flutter/shell/platform/linux/fl_engine_test.cc
++++ b/engine/src/flutter/shell/platform/linux/fl_engine_test.cc
+@@ -6,6 +6,8 @@
+ #include "flutter/shell/platform/linux/testing/linux_test.h"
+ #include "gtest/gtest.h"
+ 
++#include <functional>
++
+ #include "flutter/shell/platform/embedder/test_utils/proc_table_replacement.h"
+ #include "flutter/shell/platform/linux/fl_engine_private.h"
+ #include "flutter/shell/platform/linux/fl_framebuffer.h"
+@@ -13,6 +15,7 @@
+ #include "flutter/shell/platform/linux/public/flutter_linux/fl_json_message_codec.h"
+ #include "flutter/shell/platform/linux/public/flutter_linux/fl_string_codec.h"
+ #include "flutter/shell/platform/linux/testing/mock_epoxy.h"
++#include "flutter/shell/platform/linux/testing/mock_gtk.h"
+ #include "flutter/shell/platform/linux/testing/mock_renderable.h"
+ 
+ // MOCK_ENGINE_PROC is leaky by design
+@@ -72,6 +75,164 @@ TEST_F(FlEngineTest, NotifyDisplayUpdate) {
+   EXPECT_TRUE(called);
+ }
+ 
++// Starts the engine, capturing the vsync callback it registers, and mocks the
++// clock so vsync times are deterministic. The engine is started at the time
++// currently in *current_time_nanos, which becomes the vsync phase.
++static VsyncCallback start_engine_with_vsync(
++    FlEngine* engine,
++    uint64_t* current_time_nanos,
++    std::function<void(uint64_t, uint64_t)> on_vsync) {
++  static VsyncCallback callback;
++  callback = nullptr;
++  fl_engine_get_embedder_api(engine)->Initialize = MOCK_ENGINE_PROC(
++      Initialize, ([](size_t version, const FlutterRendererConfig* config,
++                      const FlutterProjectArgs* args, void* user_data,
++                      FLUTTER_API_SYMBOL(FlutterEngine) * engine_out) {
++        callback = args->vsync_callback;
++        return kSuccess;
++      }));
++  fl_engine_get_embedder_api(engine)->RunInitialized =
++      MOCK_ENGINE_PROC(RunInitialized, ([](auto engine) { return kSuccess; }));
++  fl_engine_get_embedder_api(engine)->GetCurrentTime = MOCK_ENGINE_PROC(
++      GetCurrentTime, ([current_time_nanos]() { return *current_time_nanos; }));
++  fl_engine_get_embedder_api(engine)->OnVsync = MOCK_ENGINE_PROC(
++      OnVsync,
++      ([on_vsync](auto engine, intptr_t baton, uint64_t frame_start_time_nanos,
++                  uint64_t frame_target_time_nanos) {
++        EXPECT_EQ(baton, 42);
++        on_vsync(frame_start_time_nanos, frame_target_time_nanos);
++        return kSuccess;
++      }));
++
++  EXPECT_TRUE(fl_engine_start(engine, nullptr));
++  EXPECT_NE(callback, nullptr);
++  return callback;
++}
++
++// Checks vsync events are generated at the display refresh rate.
++TEST_F(FlEngineTest, Vsync) {
++  constexpr uint64_t kFrameInterval = 1000000000 / 60;
++
++  uint64_t current_time = 0;
++  uint64_t frame_start_time = 0, frame_target_time = 0;
++  int vsync_count = 0;
++  VsyncCallback vsync_callback = start_engine_with_vsync(
++      engine, &current_time, [&](uint64_t start_time, uint64_t target_time) {
++        vsync_count++;
++        frame_start_time = start_time;
++        frame_target_time = target_time;
++      });
++
++  // Part way through the first frame - snaps to the next tick.
++  current_time = 10000000;
++  vsync_callback(engine, 42);
++  EXPECT_EQ(vsync_count, 1);
++  EXPECT_EQ(frame_start_time, kFrameInterval);
++  EXPECT_EQ(frame_target_time, 2 * kFrameInterval);
++
++  // Exactly on a tick - the frame can start now.
++  current_time = 3 * kFrameInterval;
++  vsync_callback(engine, 42);
++  EXPECT_EQ(vsync_count, 2);
++  EXPECT_EQ(frame_start_time, 3 * kFrameInterval);
++  EXPECT_EQ(frame_target_time, 4 * kFrameInterval);
++}
++
++// Checks a vsync request from before the first tick snaps to that tick rather
++// than skipping past it.
++TEST_F(FlEngineTest, VsyncBeforePhase) {
++  constexpr uint64_t kFrameInterval = 1000000000 / 60;
++  constexpr uint64_t kStartTime = 5000000;
++
++  uint64_t current_time = kStartTime;
++  uint64_t frame_start_time = 0, frame_target_time = 0;
++  VsyncCallback vsync_callback = start_engine_with_vsync(
++      engine, &current_time, [&](uint64_t start_time, uint64_t target_time) {
++        frame_start_time = start_time;
++        frame_target_time = target_time;
++      });
++
++  // The clock reads earlier than the phase - the first tick is the phase.
++  current_time = 1000000;
++  vsync_callback(engine, 42);
++  EXPECT_EQ(frame_start_time, kStartTime);
++  EXPECT_EQ(frame_target_time, kStartTime + kFrameInterval);
++
++  // Exactly on the phase - the frame can start now.
++  current_time = kStartTime;
++  vsync_callback(engine, 42);
++  EXPECT_EQ(frame_start_time, kStartTime);
++  EXPECT_EQ(frame_target_time, kStartTime + kFrameInterval);
++
++  // Just after the phase - snaps to the next tick after it.
++  current_time = kStartTime + 1;
++  vsync_callback(engine, 42);
++  EXPECT_EQ(frame_start_time, kStartTime + kFrameInterval);
++  EXPECT_EQ(frame_target_time, kStartTime + 2 * kFrameInterval);
++}
++
++// Checks vsync events follow the refresh rate of a high refresh rate display.
++TEST_F(FlEngineTest, VsyncHighRefreshRate) {
++  ::testing::NiceMock<flutter::testing::MockGtk> mock_gtk;
++  EXPECT_CALL(mock_gtk, gdk_monitor_get_refresh_rate(::testing::_))
++      .WillRepeatedly(::testing::Return(144000));
++  constexpr uint64_t kFrameInterval = 1000000000 / 144;
++
++  uint64_t current_time = 0;
++  uint64_t frame_start_time = 0, frame_target_time = 0;
++  int vsync_count = 0;
++  VsyncCallback vsync_callback = start_engine_with_vsync(
++      engine, &current_time, [&](uint64_t start_time, uint64_t target_time) {
++        vsync_count++;
++        frame_start_time = start_time;
++        frame_target_time = target_time;
++      });
++
++  current_time = 10000000;
++  vsync_callback(engine, 42);
++  EXPECT_EQ(vsync_count, 1);
++  EXPECT_EQ(frame_start_time, 2 * kFrameInterval);
++  EXPECT_EQ(frame_target_time, 3 * kFrameInterval);
++  EXPECT_LT(frame_target_time - frame_start_time, 7000000u);
++}
++
++// Checks the vsync rate follows the display a view is on.
++TEST_F(FlEngineTest, VsyncFollowsViewDisplay) {
++  ::testing::NiceMock<flutter::testing::MockGtk> mock_gtk;
++  constexpr uint64_t kFrameInterval60 = 1000000000 / 60;
++  constexpr uint64_t kFrameInterval144 = 1000000000 / 144;
++
++  uint64_t current_time = 0;
++  uint64_t frame_start_time = 0, frame_target_time = 0;
++  VsyncCallback vsync_callback = start_engine_with_vsync(
++      engine, &current_time, [&](uint64_t start_time, uint64_t target_time) {
++        frame_start_time = start_time;
++        frame_target_time = target_time;
++      });
++
++  // The (single, mocked) display switches to 144Hz after the engine started,
++  // so the recorded display rate is still 60Hz until the engine is told about
++  // a view on that display.
++  ON_CALL(mock_gtk, gdk_monitor_get_refresh_rate(::testing::_))
++      .WillByDefault(::testing::Return(144000));
++
++  // A view on an unknown display uses the fastest display.
++  fl_engine_send_window_metrics_event(engine, 0, 1, 100, 100, 100, 100, 1.0);
++  vsync_callback(engine, 42);
++  EXPECT_EQ(frame_target_time - frame_start_time, kFrameInterval144);
++
++  // A view on display 1.
++  fl_engine_send_window_metrics_event(engine, 1, 1, 100, 100, 100, 100, 1.0);
++  vsync_callback(engine, 42);
++  EXPECT_EQ(frame_target_time - frame_start_time, kFrameInterval144);
++
++  ON_CALL(mock_gtk, gdk_monitor_get_refresh_rate(::testing::_))
++      .WillByDefault(::testing::Return(60000));
++  fl_engine_send_window_metrics_event(engine, 1, 1, 100, 100, 100, 100, 1.0);
++  vsync_callback(engine, 42);
++  EXPECT_EQ(frame_target_time - frame_start_time, kFrameInterval60);
++}
++
+ // Checks sending window metrics events works.
+ TEST_F(FlEngineTest, WindowMetrics) {
+   StartEngine();
+diff --git a/engine/src/flutter/shell/platform/linux/fl_subsurface.cc b/engine/src/flutter/shell/platform/linux/fl_subsurface.cc
+index 918db4398728c..74e0fd6c1c505 100644
+--- a/engine/src/flutter/shell/platform/linux/fl_subsurface.cc
++++ b/engine/src/flutter/shell/platform/linux/fl_subsurface.cc
+@@ -12,6 +12,9 @@ struct _FlSubsurface {
+   // Surface backing the subsurface and the subsurface itself.
+   struct wl_surface* surface;
+   struct wl_subsurface* subsurface;
++
++  // Surface this subsurface is attached to, owned by the toolkit.
++  struct wl_surface* parent_surface;
+ };
+ 
+ G_DEFINE_TYPE(FlSubsurface, fl_subsurface, G_TYPE_OBJECT)
+@@ -37,6 +40,7 @@ FlSubsurface* fl_subsurface_new(struct wl_compositor* compositor,
+   FlSubsurface* self =
+       FL_SUBSURFACE(g_object_new(fl_subsurface_get_type(), nullptr));
+ 
++  self->parent_surface = parent_surface;
+   self->surface = wl_compositor_create_surface(compositor);
+   self->subsurface = wl_subcompositor_get_subsurface(
+       subcompositor, self->surface, parent_surface);
+@@ -61,3 +65,10 @@ void fl_subsurface_set_position(FlSubsurface* self, gint x, gint y) {
+   g_return_if_fail(FL_IS_SUBSURFACE(self));
+   wl_subsurface_set_position(self->subsurface, x, y);
+ }
++
++void fl_subsurface_commit_parent(FlSubsurface* self) {
++  g_return_if_fail(FL_IS_SUBSURFACE(self));
++  if (self->parent_surface != nullptr) {
++    wl_surface_commit(self->parent_surface);
++  }
++}
+diff --git a/engine/src/flutter/shell/platform/linux/fl_subsurface.h b/engine/src/flutter/shell/platform/linux/fl_subsurface.h
+index 17af5b6b186b2..f94019c5a8257 100644
+--- a/engine/src/flutter/shell/platform/linux/fl_subsurface.h
++++ b/engine/src/flutter/shell/platform/linux/fl_subsurface.h
+@@ -57,6 +57,17 @@ struct wl_surface* fl_subsurface_get_surface(FlSubsurface* subsurface);
+  */
+ void fl_subsurface_set_position(FlSubsurface* subsurface, gint x, gint y);
+ 
++/**
++ * fl_subsurface_commit_parent:
++ * @subsurface: an #FlSubsurface.
++ *
++ * Commits the parent surface. The subsurface is synchronized with its parent,
++ * so pending state such as a newly presented frame or position is only shown
++ * once the parent surface is committed. This applies that state without
++ * requiring the parent to be redrawn.
++ */
++void fl_subsurface_commit_parent(FlSubsurface* subsurface);
++
+ G_END_DECLS
+ 
+ #endif  // FLUTTER_SHELL_PLATFORM_LINUX_FL_SUBSURFACE_H_
+diff --git a/engine/src/flutter/shell/platform/linux/fl_subsurface_egl.cc b/engine/src/flutter/shell/platform/linux/fl_subsurface_egl.cc
+index d1c6b3c36cb31..d4291bce9b469 100644
+--- a/engine/src/flutter/shell/platform/linux/fl_subsurface_egl.cc
++++ b/engine/src/flutter/shell/platform/linux/fl_subsurface_egl.cc
+@@ -25,6 +25,14 @@ struct _FlSubsurfaceEGL {
+   // Native Wayland window backing the EGL surface.
+   struct wl_egl_window* egl_window;
+ 
++  // Buffer scale currently set on the Wayland surface.
++  gint scale;
++
++  // Scale factor requested by the widget; applied to the surface in present()
++  // once a frame of a matching size is available. Read and written atomically
++  // since it is set from the GTK thread and consumed from the render thread.
++  gint pending_scale;
++
+   // EGL context used to blit engine frames. Shares resources with the engine's
+   // render context.
+   EGLContext egl_context;
+@@ -120,6 +128,8 @@ static void setup(FlSubsurfaceEGL* self,
+   }
+ 
+   wl_surface_set_buffer_scale(surface, scale);
++  self->scale = scale;
++  g_atomic_int_set(&self->pending_scale, scale);
+ 
+   eglMakeCurrent(egl_display, self->egl_surface, self->egl_surface,
+                  self->egl_context);
+@@ -212,6 +222,12 @@ void fl_subsurface_egl_resize(FlSubsurfaceEGL* self,
+   }
+ }
+ 
++void fl_subsurface_egl_set_scale(FlSubsurfaceEGL* self, gint scale) {
++  g_return_if_fail(FL_IS_SUBSURFACE_EGL(self));
++  g_return_if_fail(scale > 0);
++  g_atomic_int_set(&self->pending_scale, scale);
++}
++
+ void fl_subsurface_egl_present(FlSubsurfaceEGL* self,
+                                GLuint texture_id,
+                                size_t width,
+@@ -268,6 +284,18 @@ void fl_subsurface_egl_present(FlSubsurfaceEGL* self,
+     glBindTexture(GL_TEXTURE_2D, texture_id);
+     glDrawArrays(GL_TRIANGLES, 0, 6);
+   }
++  // Apply a changed scale factor together with the first frame whose size is
++  // a multiple of it. The buffer scale is double-buffered surface state, so
++  // sending it here makes it take effect in the commit eglSwapBuffers performs
++  // below, atomically with the attached buffer.
++  gint scale = g_atomic_int_get(&self->pending_scale);
++  if (scale != self->scale && scale > 0 && width % scale == 0 &&
++      height % scale == 0) {
++    wl_surface_set_buffer_scale(fl_subsurface_get_surface(self->subsurface),
++                                scale);
++    self->scale = scale;
++  }
++
+   eglSwapBuffers(egl_display, self->egl_surface);
+ 
+   // Restore the engine's rendering context so the raster thread can continue
+diff --git a/engine/src/flutter/shell/platform/linux/fl_subsurface_egl.h b/engine/src/flutter/shell/platform/linux/fl_subsurface_egl.h
+index e686264bfb22e..fea5953b0a6c2 100644
+--- a/engine/src/flutter/shell/platform/linux/fl_subsurface_egl.h
++++ b/engine/src/flutter/shell/platform/linux/fl_subsurface_egl.h
+@@ -64,6 +64,22 @@ void fl_subsurface_egl_resize(FlSubsurfaceEGL* egl,
+                               size_t width,
+                               size_t height);
+ 
++/**
++ * fl_subsurface_egl_set_scale:
++ * @egl: an #FlSubsurfaceEGL.
++ * @scale: the new window scale factor.
++ *
++ * Records a change of the widget's scale factor, for example after the window
++ * moved to a monitor with a different scale. The subsurface's buffer scale is
++ * updated in the next fl_subsurface_egl_present() whose frame size is a
++ * multiple of @scale, so the new scale and a buffer of the matching size are
++ * committed together. Wayland requires buffer sizes to be a multiple of the
++ * buffer scale, so applying the scale to a frame of the old size could raise a
++ * protocol error. Safe to call from the GTK thread while frames are presented
++ * from another thread.
++ */
++void fl_subsurface_egl_set_scale(FlSubsurfaceEGL* egl, gint scale);
++
+ /**
+  * fl_subsurface_egl_present:
+  * @egl: an #FlSubsurfaceEGL.
+diff --git a/engine/src/flutter/shell/platform/linux/fl_subsurface_test.cc b/engine/src/flutter/shell/platform/linux/fl_subsurface_test.cc
+index 16f27fa384b26..85137a60c1281 100644
+--- a/engine/src/flutter/shell/platform/linux/fl_subsurface_test.cc
++++ b/engine/src/flutter/shell/platform/linux/fl_subsurface_test.cc
+@@ -80,6 +80,16 @@ TEST_F(FlSubsurfaceTest, SetPosition) {
+   fl_subsurface_set_position(subsurface, 3, 4);
+ }
+ 
++TEST_F(FlSubsurfaceTest, CommitParent) {
++  g_autoptr(FlSubsurface) subsurface = CreateSubsurface();
++  ASSERT_NE(subsurface, nullptr);
++
++  // Committing the parent applies the synchronized subsurface state.
++  EXPECT_CALL(wayland,
++              Request(::testing::StrEq("wl_surface"), WL_SURFACE_COMMIT));
++  fl_subsurface_commit_parent(subsurface);
++}
++
+ // The Wayland objects are released when the subsurface is destroyed.
+ TEST_F(FlSubsurfaceTest, Destroy) {
+   FlSubsurface* subsurface = CreateSubsurface();
+diff --git a/engine/src/flutter/shell/platform/linux/fl_view_renderer_subsurface.cc b/engine/src/flutter/shell/platform/linux/fl_view_renderer_subsurface.cc
+index 3a87a3e9bb764..c91d5e0a14bf0 100644
+--- a/engine/src/flutter/shell/platform/linux/fl_view_renderer_subsurface.cc
++++ b/engine/src/flutter/shell/platform/linux/fl_view_renderer_subsurface.cc
+@@ -130,7 +130,13 @@ static gboolean redraw_cb(gpointer user_data) {
+     }
+   }
+ 
+-  gtk_widget_queue_draw(GTK_WIDGET(self));
++  // The frame has already been presented to the subsurface; committing the
++  // parent surface makes it visible. Redrawing the widget would also do this,
++  // but repaints the whole window in software which is far too slow to do for
++  // every frame on large displays.
++  if (self->subsurface != nullptr) {
++    fl_subsurface_commit_parent(self->subsurface);
++  }
+ 
+   return G_SOURCE_REMOVE;
+ }
+@@ -227,10 +233,30 @@ static void fl_view_renderer_subsurface_size_allocate(
+ 
+   update_subsurface_position(self);
+   if (self->egl != nullptr) {
++    fl_subsurface_egl_set_scale(self->egl, scale_factor);
+     fl_subsurface_egl_resize(self->egl, width, height);
+   }
+ }
+ 
++// Called when the widget's scale factor changes, typically because the window
++// moved to a monitor with a different scale. GTK only queues a redraw for
++// this, not a resize, so the subsurface would keep its old buffer scale while
++// the engine renders frames at the new size, showing them at the wrong size.
++// Record the new scale for the subsurface and queue a resize so FlView sends
++// the engine new window metrics and the frame of the new size is waited for.
++static void fl_view_renderer_subsurface_scale_factor_changed(
++    GObject* object,
++    GParamSpec* pspec,
++    gpointer user_data) {
++  FlViewRendererSubsurface* self = FL_VIEW_RENDERER_SUBSURFACE(object);
++  GtkWidget* widget = GTK_WIDGET(self);
++
++  if (self->egl != nullptr) {
++    fl_subsurface_egl_set_scale(self->egl, gtk_widget_get_scale_factor(widget));
++  }
++  gtk_widget_queue_resize(widget);
++}
++
+ // Runs after the size_allocate default handler and, crucially, after FlView has
+ // sent the new window metrics to the engine (connected with
+ // g_signal_connect_after). By this point the engine is already producing a
+@@ -384,6 +410,10 @@ static void fl_view_renderer_subsurface_init(FlViewRendererSubsurface* self) {
+   g_signal_connect_after(
+       self, "size-allocate",
+       G_CALLBACK(fl_view_renderer_subsurface_size_allocate_after), nullptr);
++
++  g_signal_connect(self, "notify::scale-factor",
++                   G_CALLBACK(fl_view_renderer_subsurface_scale_factor_changed),
++                   nullptr);
+ }
+ 
+ FlViewRendererSubsurface* fl_view_renderer_subsurface_new(
+diff --git a/engine/src/flutter/shell/platform/linux/testing/mock_engine.cc b/engine/src/flutter/shell/platform/linux/testing/mock_engine.cc
+index c414ff14a261a..a3edc1ca8131f 100644
+--- a/engine/src/flutter/shell/platform/linux/testing/mock_engine.cc
++++ b/engine/src/flutter/shell/platform/linux/testing/mock_engine.cc
+@@ -9,6 +9,8 @@
+ //
+ // Over time existing tests should be migrated and this file should be removed.
+ 
++#include <glib.h>
++
+ #include <cstring>
+ #include <unordered_map>
+ #include <utility>
+@@ -188,6 +190,19 @@ FlutterEngineResult FlutterEngineAddView(FLUTTER_API_SYMBOL(FlutterEngine)
+   return kSuccess;
+ }
+ 
++FlutterEngineResult FlutterEngineOnVsync(FLUTTER_API_SYMBOL(FlutterEngine)
++                                             engine,
++                                         intptr_t baton,
++                                         uint64_t frame_start_time_nanos,
++                                         uint64_t frame_target_time_nanos) {
++  return kSuccess;
++}
++
++uint64_t FlutterEngineGetCurrentTime() {
++  // Match the engine, which uses the monotonic clock in nanoseconds.
++  return g_get_monotonic_time() * 1000;
++}
++
+ FlutterEngineResult FlutterEngineRemoveView(FLUTTER_API_SYMBOL(FlutterEngine)
+                                                 engine,
+                                             const FlutterRemoveViewInfo* info) {
+@@ -236,5 +251,7 @@ FlutterEngineResult FlutterEngineGetProcAddresses(
+   table->NotifyDisplayUpdate = &FlutterEngineNotifyDisplayUpdate;
+   table->AddView = &FlutterEngineAddView;
+   table->RemoveView = &FlutterEngineRemoveView;
++  table->OnVsync = &FlutterEngineOnVsync;
++  table->GetCurrentTime = &FlutterEngineGetCurrentTime;
+   return kSuccess;
+ }
+diff --git a/engine/src/flutter/shell/platform/linux/testing/mock_gtk.cc b/engine/src/flutter/shell/platform/linux/testing/mock_gtk.cc
+index 2a2104f815f2b..1ce7f1ad38666 100644
+--- a/engine/src/flutter/shell/platform/linux/testing/mock_gtk.cc
++++ b/engine/src/flutter/shell/platform/linux/testing/mock_gtk.cc
+@@ -39,6 +39,8 @@ MockGtk::MockGtk() {
+       .WillByDefault(::testing::Return(100));
+   ON_CALL(*this, gdk_window_get_height(::testing::_))
+       .WillByDefault(::testing::Return(100));
++  ON_CALL(*this, gdk_monitor_get_refresh_rate(::testing::_))
++      .WillByDefault(::testing::Return(60000));
+ }
+ 
+ MockGtk::~MockGtk() {
+@@ -129,7 +131,10 @@ void gdk_monitor_get_geometry(GdkMonitor* monitor, GdkRectangle* geometry) {
+ 
+ int gdk_monitor_get_refresh_rate(GdkMonitor* monitor) {
+   check_thread();
+-  return 60000;
++  if (mock == nullptr) {
++    return 60000;
++  }
++  return mock->gdk_monitor_get_refresh_rate(monitor);
+ }
+ 
+ int gdk_monitor_get_scale_factor(GdkMonitor* monitor) {
+diff --git a/engine/src/flutter/shell/platform/linux/testing/mock_gtk.h b/engine/src/flutter/shell/platform/linux/testing/mock_gtk.h
+index c8e0a669277d2..4777c506a91c9 100644
+--- a/engine/src/flutter/shell/platform/linux/testing/mock_gtk.h
++++ b/engine/src/flutter/shell/platform/linux/testing/mock_gtk.h
+@@ -25,6 +25,7 @@ class MockGtk {
+   MOCK_METHOD(GdkWindowState, gdk_window_get_state, (GdkWindow * window));
+   MOCK_METHOD(int, gdk_window_get_width, (GdkWindow * window));
+   MOCK_METHOD(int, gdk_window_get_height, (GdkWindow * window));
++  MOCK_METHOD(int, gdk_monitor_get_refresh_rate, (GdkMonitor * monitor));
+   MOCK_METHOD(void, gtk_window_new, (GtkWindow * window, GtkWindowType type));
+   MOCK_METHOD(void,
+               gtk_window_set_default_size,

@@ -1,0 +1,47 @@
+name: Build Linux engine
+
+# Manual only: rebuilding the patched engine is a ~30-90 minute, ~15-20 GB
+# operation, only needed when Querya-Desktop bumps its pinned Flutter version.
+# See README.md "Rebuilding for a new Flutter version".
+on:
+  workflow_dispatch:
+    inputs:
+      flutter_commit:
+        description: >-
+          Flutter framework git commit to build from (the "Framework •
+          revision" line of `flutter --version` on the target Flutter
+          version/channel).
+        required: true
+      runtime_mode:
+        description: 'release | profile | debug'
+        required: false
+        default: 'release'
+
+jobs:
+  build:
+    name: Build patched libflutter_linux_gtk.so
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          df -h
+
+      - name: Install engine build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config \
+            libgtk-3-dev libsecret-1-dev python3
+
+      - name: Build
+        run: ./scripts/build.sh "${{ inputs.flutter_commit }}" "${{ inputs.runtime_mode }}"
+
+      - name: Publish release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CONTENT_HASH="$(grep '^content_hash' .build/flutter/engine/src/out/host_${{ inputs.runtime_mode }}/args.gn | sed 's/.*"\(.*\)"/\1/')"
+          ./scripts/publish_release.sh "$CONTENT_HASH" "${{ inputs.runtime_mode }}"
